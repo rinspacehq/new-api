@@ -24,6 +24,7 @@ import (
 )
 
 const rinOperationHeader = "X-Rinspace-Operation-Key"
+const rinOperationStatusHeader = "X-Rinspace-Operation-Status"
 const rinReceiptLimit = 1 << 20
 
 type rinReceiptWriter struct {
@@ -208,6 +209,7 @@ func RinOperationReceipt() gin.HandlerFunc {
 			}
 			original.Header()[name] = values
 		}
+		original.Header().Set(rinOperationStatusHeader, status)
 		c.Data(captured.Status(), captured.header.Get("Content-Type"), captured.body.Bytes())
 	}
 }
@@ -215,8 +217,10 @@ func RinOperationReceipt() gin.HandlerFunc {
 func writeRinOperationReceipt(c *gin.Context, aead cipher.AEAD, operation model.RinOperation) {
 	switch operation.Status {
 	case model.RinOperationUnknown:
+		c.Header(rinOperationStatusHeader, model.RinOperationUnknown)
 		c.JSON(http.StatusAccepted, gin.H{"status": "unknown"})
 	case model.RinOperationExpired:
+		c.Header(rinOperationStatusHeader, model.RinOperationExpired)
 		c.JSON(http.StatusGone, gin.H{"status": "expired"})
 	case model.RinOperationCompleted, model.RinOperationFailed:
 		body, err := decryptRinReceipt(aead, operation)
@@ -224,6 +228,7 @@ func writeRinOperationReceipt(c *gin.Context, aead cipher.AEAD, operation model.
 			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rin operation receipt is unavailable"})
 			return
 		}
+		c.Header(rinOperationStatusHeader, operation.Status)
 		c.Data(operation.HTTPStatus, "application/json", body)
 	default:
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rin operation receipt is invalid"})

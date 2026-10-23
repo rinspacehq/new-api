@@ -159,9 +159,12 @@ func TestRinOperationReceiptNeverRepeatsModelCall(t *testing.T) {
 	}
 	first := send(http.MethodPost, "op-one", requestBody)
 	require.Equal(t, http.StatusOK, first.Code)
+	assert.Equal(t, model.RinOperationCompleted, first.Header().Get(rinOperationStatusHeader))
 	assert.Contains(t, first.Body.String(), "private answer")
 	assert.Equal(t, first.Body.String(), send(http.MethodPost, "op-one", requestBody).Body.String())
-	assert.Equal(t, first.Body.String(), send(http.MethodGet, "op-one", "").Body.String())
+	queried := send(http.MethodGet, "op-one", "")
+	assert.Equal(t, first.Body.String(), queried.Body.String())
+	assert.Equal(t, model.RinOperationCompleted, queried.Header().Get(rinOperationStatusHeader))
 	assert.Equal(t, 1, calls)
 	withoutKey := httptest.NewRecorder()
 	engine.ServeHTTP(withoutKey, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(requestBody)))
@@ -178,4 +181,45 @@ func TestRinOperationReceiptNeverRepeatsModelCall(t *testing.T) {
 	require.NoError(t, model.ExpireRinOperationReceipts(db, time.Now().Add(time.Minute)))
 	assert.Equal(t, http.StatusGone, send(http.MethodPost, "op-one", requestBody).Code)
 	assert.Equal(t, 1, calls)
+}
+
+func TestRinReceiptQueryDistinguishesStoredFailureFromUnavailable(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := gorm.Open(sqlite.Open("file:rin_failed_receipts?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.RinOperation{}))
+	previous := model.DB
+	model.DB = db
+	t.Cleanup(func() { model.DB = previous })
+	t.Setenv("RINSPACE_RIN_TOKEN_ID", "91")
+	key := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{9}, 32))
+	t.Setenv("RINSPACE_RIN_RECEIPT_KEY", key)
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) { c.Set("token_id", 91); c.Next() })
+	engine.Use(RinTokenScope(), RinOperationReceipt())
+	calls := 0
+	engine.POST("/v1/chat/completions", func(c *gin.Context) {
+		calls++
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "upstream unavailable"})
+	})
+	engine.GET("/v1/rin/operations/:key", ReadRinOperationReceipt())
+
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"deepseek-flash","stream":false,"max_tokens":100}`))
+	request.Header.Set(rinOperationHeader, "failed-one")
+	first := httptest.NewRecorder()
+	engine.ServeHTTP(first, request)
+	require.Equal(t, http.StatusServiceUnavailable, first.Code)
+	assert.Equal(t, model.RinOperationFailed, first.Header().Get(rinOperationStatusHeader))
+	query := httptest.NewRequest(http.MethodGet, "/v1/rin/operations/failed-one", nil)
+	replay := httptest.NewRecorder()
+	engine.ServeHTTP(replay, query)
+	assert.Equal(t, first.Body.String(), replay.Body.String())
+	assert.Equal(t, model.RinOperationFailed, replay.Header().Get(rinOperationStatusHeader))
+	assert.Equal(t, 1, calls)
+
+	t.Setenv("RINSPACE_RIN_RECEIPT_KEY", "")
+	unavailable := httptest.NewRecorder()
+	engine.ServeHTTP(unavailable, httptest.NewRequest(http.MethodGet, "/v1/rin/operations/failed-one", nil))
+	assert.Equal(t, http.StatusServiceUnavailable, unavailable.Code)
+	assert.Empty(t, unavailable.Header().Get(rinOperationStatusHeader))
 }
