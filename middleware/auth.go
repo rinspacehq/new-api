@@ -521,6 +521,10 @@ func TokenAuthReadOnly() func(c *gin.Context) {
 		c.Set("id", token.UserId)
 		c.Set("token_id", token.Id)
 		c.Set("token_key", token.Key)
+		if !rinTokenAllowed(token.Id, c.Request.Method, c.Request.URL.Path) {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
 		c.Next()
 	}
 }
@@ -640,6 +644,10 @@ func TokenAuth() func(c *gin.Context) {
 
 		err = SetupContextForToken(c, token, parts...)
 		if err != nil {
+			return
+		}
+		if !rinTokenAllowed(token.Id, c.Request.Method, c.Request.URL.Path) {
+			c.AbortWithStatus(http.StatusForbidden)
 			return
 		}
 		c.Next()

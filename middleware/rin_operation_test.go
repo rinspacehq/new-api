@@ -89,6 +89,22 @@ func TestRinOperationStoreSQLite(t *testing.T) {
 	testRinOperationStore(t, db)
 }
 
+func TestRinDedicatedTokenCannotUseOtherTokenRoutes(t *testing.T) {
+	t.Setenv("RINSPACE_RIN_TOKEN_ID", "91")
+	for _, route := range []struct{ method, path string }{
+		{http.MethodGet, "/v1/models"},
+		{http.MethodPost, "/v1beta/models/deepseek-flash:generateContent"},
+		{http.MethodGet, "/v1beta/openai/models"},
+		{http.MethodPost, "/v1/completions"},
+	} {
+		assert.False(t, rinTokenAllowed(91, route.method, route.path), "%s %s", route.method, route.path)
+		assert.True(t, rinTokenAllowed(92, route.method, route.path), "other tokens must be unaffected")
+	}
+	assert.True(t, rinTokenAllowed(91, http.MethodPost, "/v1/chat/completions"))
+	assert.True(t, rinTokenAllowed(91, http.MethodGet, "/v1/rin/operations/op-one"))
+	assert.False(t, rinTokenAllowed(91, http.MethodPost, "/v1/rin/operations/op-one"))
+}
+
 func TestRinOperationStoreMySQL(t *testing.T) {
 	dsn := strings.TrimSpace(os.Getenv("TEST_MYSQL_DSN"))
 	if dsn == "" {

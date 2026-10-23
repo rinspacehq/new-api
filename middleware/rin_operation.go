@@ -103,15 +103,20 @@ func rinTokenID() int {
 
 // RinTokenScope confines the dedicated service token to the two endpoints
 // needed by the Rin chat integration, even if its model limits are mis-set.
+func rinTokenAllowed(tokenID int, method, path string) bool {
+	configured := rinTokenID()
+	if configured == 0 || tokenID != configured {
+		return true
+	}
+	return method == http.MethodPost && path == "/v1/chat/completions" ||
+		method == http.MethodGet && strings.HasPrefix(path, "/v1/rin/operations/")
+}
+
 func RinTokenScope() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if configured := rinTokenID(); configured != 0 && c.GetInt("token_id") == configured {
-			chat := c.Request.Method == http.MethodPost && c.Request.URL.Path == "/v1/chat/completions"
-			receipt := c.Request.Method == http.MethodGet && strings.HasPrefix(c.Request.URL.Path, "/v1/rin/operations/")
-			if !chat && !receipt {
-				c.AbortWithStatus(http.StatusForbidden)
-				return
-			}
+		if !rinTokenAllowed(c.GetInt("token_id"), c.Request.Method, c.Request.URL.Path) {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
 		}
 		c.Next()
 	}
