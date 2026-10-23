@@ -31,7 +31,6 @@ func testRinOperationStore(t *testing.T, db *gorm.DB) {
 	t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(legacyTable)) })
 	tableDB := db.Table(table)
 	require.NoError(t, tableDB.AutoMigrate(&model.RinOperation{}))
-	require.NoError(t, tableDB.AutoMigrate(&model.RinOperation{}), "migration must be repeatable")
 	t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(table)) })
 	var legacy model.Token
 	require.NoError(t, db.Session(&gorm.Session{NewDB: true}).Table(legacyTable).Where("key = ?", "legacy-rin-token").Take(&legacy).Error)
@@ -70,6 +69,13 @@ func testRinOperationStore(t *testing.T, db *gorm.DB) {
 	assert.False(t, claimed)
 	assert.Equal(t, model.RinOperationCompleted, stored.Status)
 	assert.True(t, bytes.Equal(answer, stored.ResponseCiphertext))
+	require.NoError(t, tableDB.AutoMigrate(&model.RinOperation{}), "upgrade over a completed receipt must preserve it")
+	require.NoError(t, tableDB.AutoMigrate(&model.RinOperation{}), "a repeated startup migration must be harmless")
+	require.NoError(t, operationDB().Where("token_id = ? AND operation_key = ?", 91, "rin-01").Take(&stored).Error)
+	assert.Equal(t, model.RinOperationCompleted, stored.Status)
+	assert.True(t, bytes.Equal(answer, stored.ResponseCiphertext))
+	require.NoError(t, legacyDB.Where("key = ?", "legacy-rin-token").Take(&legacy).Error)
+	assert.Equal(t, 91, legacy.UserId)
 
 	require.NoError(t, model.ExpireRinOperationReceipts(operationDB(), time.Now().Add(time.Minute)))
 	stored, claimed, err = model.ClaimRinOperation(operationDB(), 91, "rin-01", hash)
