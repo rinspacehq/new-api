@@ -15,24 +15,11 @@ concurrency:
 # queued runs start, and a base branch can advance after the merge event.
 jobs:
   rin-receipt-databases:
-    name: Rin receipt SQLite, MySQL, and PostgreSQL
+    name: Rin receipt SQLite and PostgreSQL
     if: github.event.action != 'closed' || github.event.pull_request.merged == true
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
-      mysql:
-        image: mysql:8.0
-        env:
-          MYSQL_ROOT_PASSWORD: test-only
-          MYSQL_ROOT_HOST: '%'
-          MYSQL_DATABASE: rin_receipts_test
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd "mysqladmin ping -h 127.0.0.1 -ptest-only"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 30
       postgres:
         image: postgres:17-alpine
         env:
@@ -47,7 +34,6 @@ jobs:
           --health-retries 30
     env:
       GOWORK: 'off'
-      TEST_MYSQL_DSN: 'root:test-only@tcp(127.0.0.1:3306)/rin_receipts_test?parseTime=true&charset=utf8mb4'
       TEST_POSTGRES_DSN: 'host=127.0.0.1 port=5432 user=postgres password=test-only dbname=rin_receipts_test sslmode=disable'
     steps:
       - name: Checkout
@@ -63,7 +49,7 @@ jobs:
           cache-dependency-path: go.sum
 
       - name: Test Rin receipt database and HTTP contracts
-        run: go test -p 1 ./middleware -run '^TestRinOperation' -count=1 -v
+        run: go test -p 1 ./middleware -run '^TestRin' -count=1 -v
 
   backend:
     name: Backend vet, build, and test

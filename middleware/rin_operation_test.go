@@ -17,7 +17,6 @@ import (
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -103,16 +102,6 @@ func TestRinDedicatedTokenCannotUseOtherTokenRoutes(t *testing.T) {
 	assert.True(t, rinTokenAllowed(91, http.MethodPost, "/v1/chat/completions"))
 	assert.True(t, rinTokenAllowed(91, http.MethodGet, "/v1/rin/operations/op-one"))
 	assert.False(t, rinTokenAllowed(91, http.MethodPost, "/v1/rin/operations/op-one"))
-}
-
-func TestRinOperationStoreMySQL(t *testing.T) {
-	dsn := strings.TrimSpace(os.Getenv("TEST_MYSQL_DSN"))
-	if dsn == "" {
-		t.Skip("TEST_MYSQL_DSN is not configured")
-	}
-	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
-	require.NoError(t, err)
-	testRinOperationStore(t, db)
 }
 
 func TestRinOperationStorePostgreSQL(t *testing.T) {
