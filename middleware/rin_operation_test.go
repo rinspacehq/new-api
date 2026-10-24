@@ -57,7 +57,7 @@ func testRinOperationStore(t *testing.T, db *gorm.DB) {
 	_, claimed, err := model.ClaimRinOperation(operationDB(), 91, "rin-01", strings.Repeat("f", 64))
 	require.ErrorIs(t, err, model.ErrRinOperationConflict)
 	assert.False(t, claimed)
-	_, claimed, err = model.ClaimRinOperation(operationDB(), 92, "rin-01", hash)
+	unknown, claimed, err := model.ClaimRinOperation(operationDB(), 92, "rin-01", hash)
 	require.NoError(t, err)
 	assert.True(t, claimed)
 
@@ -77,12 +77,22 @@ func testRinOperationStore(t *testing.T, db *gorm.DB) {
 	require.NoError(t, legacyDB.Where("key = ?", "legacy-rin-token").Take(&legacy).Error)
 	assert.Equal(t, 91, legacy.UserId)
 
-	require.NoError(t, model.ExpireRinOperationReceipts(operationDB(), time.Now().Add(time.Minute)))
+	require.NoError(t, model.ExpireRinOperationReceipts(operationDB(), time.Now().Add(time.Minute), time.Now().Add(-time.Minute)))
+	stillUnknown, claimed, err := model.ClaimRinOperation(operationDB(), 92, "rin-01", hash)
+	require.NoError(t, err)
+	assert.False(t, claimed)
+	assert.Equal(t, unknown.ID, stillUnknown.ID)
+	assert.Equal(t, model.RinOperationUnknown, stillUnknown.Status)
+	require.NoError(t, model.ExpireRinOperationReceipts(operationDB(), time.Now().Add(time.Minute), time.Now().Add(time.Minute)))
 	stored, claimed, err = model.ClaimRinOperation(operationDB(), 91, "rin-01", hash)
 	require.NoError(t, err)
 	assert.False(t, claimed)
 	assert.Equal(t, model.RinOperationExpired, stored.Status)
 	assert.Empty(t, stored.ResponseCiphertext)
+	expiredUnknown, claimed, err := model.ClaimRinOperation(operationDB(), 92, "rin-01", hash)
+	require.NoError(t, err)
+	assert.False(t, claimed, "an expired unknown operation must never call upstream again")
+	assert.Equal(t, model.RinOperationExpired, expiredUnknown.Status)
 }
 
 func TestRinOperationStoreSQLite(t *testing.T) {
@@ -178,7 +188,7 @@ func TestRinOperationReceiptNeverRepeatsModelCall(t *testing.T) {
 	var stored model.RinOperation
 	require.NoError(t, db.First(&stored).Error)
 	assert.NotContains(t, string(stored.ResponseCiphertext), "private answer")
-	require.NoError(t, model.ExpireRinOperationReceipts(db, time.Now().Add(time.Minute)))
+	require.NoError(t, model.ExpireRinOperationReceipts(db, time.Now().Add(time.Minute), time.Now().Add(time.Minute)))
 	assert.Equal(t, http.StatusGone, send(http.MethodPost, "op-one", requestBody).Code)
 	assert.Equal(t, 1, calls)
 }

@@ -126,7 +126,7 @@ func main() {
 				if err := middleware.ExpireOldRinReceipts(); err != nil {
 					common.SysError(common.LogText("rin receipt retention failed: %v", err))
 				}
-				time.Sleep(time.Hour)
+				time.Sleep(10 * time.Minute)
 			}
 		}()
 	}

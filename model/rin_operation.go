@@ -16,10 +16,10 @@ type RinOperation struct {
 	TokenID            int    `gorm:"uniqueIndex:idx_rin_operation_token_key;not null"`
 	OperationKey       string `gorm:"size:128;uniqueIndex:idx_rin_operation_token_key;not null"`
 	RequestHash        string `gorm:"size:64;not null"`
-	Status             string `gorm:"size:16;not null"`
+	Status             string `gorm:"size:16;not null;index:idx_rin_operation_status_created,priority:1"`
 	HTTPStatus         int
 	ResponseCiphertext []byte
-	CreatedAt          time.Time
+	CreatedAt          time.Time `gorm:"index:idx_rin_operation_status_created,priority:2"`
 	CompletedAt        *time.Time
 }
 
@@ -79,10 +79,16 @@ func CompleteRinOperation(db *gorm.DB, operationID uint64, status string, httpSt
 	return nil
 }
 
-// ExpireRinOperationReceipts removes private answers while retaining the unique
-// operation keys. Expired keys are tombstones and must not call upstream again.
-func ExpireRinOperationReceipts(db *gorm.DB, before time.Time) error {
+// ExpireRinOperationReceipts removes old private answers and expires abandoned
+// unknown operations. Both remain as tombstones so their keys cannot call the
+// upstream model a second time.
+func ExpireRinOperationReceipts(db *gorm.DB, completedBefore, unknownBefore time.Time) error {
+	if err := db.Model(&RinOperation{}).
+		Where("status IN ? AND completed_at < ?", []string{RinOperationCompleted, RinOperationFailed}, completedBefore).
+		Updates(map[string]any{"status": RinOperationExpired, "response_ciphertext": nil}).Error; err != nil {
+		return err
+	}
 	return db.Model(&RinOperation{}).
-		Where("status IN ? AND completed_at < ?", []string{RinOperationCompleted, RinOperationFailed}, before).
-		Updates(map[string]any{"status": RinOperationExpired, "response_ciphertext": nil}).Error
+		Where("status = ? AND created_at < ?", RinOperationUnknown, unknownBefore).
+		Update("status", RinOperationExpired).Error
 }

@@ -266,8 +266,9 @@ func ReadRinOperationReceipt() gin.HandlerFunc {
 	}
 }
 
-// The caller schedules this on a slow cadence. Tombstones prevent an expired
-// key from causing a second upstream call.
+// A model call times out well before an hour. An abandoned unknown operation
+// can then release the caller's reserved funds, while its key stays tombstoned.
 func ExpireOldRinReceipts() error {
-	return model.ExpireRinOperationReceipts(model.DB, time.Now().UTC().Add(-30*24*time.Hour))
+	now := time.Now().UTC()
+	return model.ExpireRinOperationReceipts(model.DB, now.Add(-30*24*time.Hour), now.Add(-time.Hour))
 }
