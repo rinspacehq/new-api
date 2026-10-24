@@ -150,7 +150,14 @@ func TestRinOperationReceiptNeverRepeatsModelCall(t *testing.T) {
 	calls := 0
 	engine.POST("/v1/chat/completions", func(c *gin.Context) {
 		calls++
+		if c.GetHeader(rinOperationHeader) == "op-stream" {
+			c.Header("Content-Type", "text/event-stream")
+			_, _ = c.Writer.Write([]byte("data: partial\n\n"))
+			c.Writer.Flush()
+			return
+		}
 		c.JSON(http.StatusOK, gin.H{"choices": []gin.H{{"message": gin.H{"content": "private answer"}}}})
+		c.Writer.Flush() // Matches the normal relay's final flush after JSON.
 	})
 	engine.GET("/v1/rin/operations/:key", ReadRinOperationReceipt())
 	engine.POST("/v1/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
@@ -191,13 +198,17 @@ func TestRinOperationReceiptNeverRepeatsModelCall(t *testing.T) {
 		assert.Equal(t, http.StatusBadRequest, send(http.MethodPost, key, invalid).Code, key)
 	}
 	assert.Equal(t, 1, calls)
+	stream := send(http.MethodPost, "op-stream", requestBody)
+	assert.Equal(t, http.StatusServiceUnavailable, stream.Code)
+	assert.Equal(t, model.RinOperationUnknown, send(http.MethodGet, "op-stream", "").Header().Get(rinOperationStatusHeader))
+	assert.Equal(t, 2, calls)
 
 	var stored model.RinOperation
 	require.NoError(t, db.First(&stored).Error)
 	assert.NotContains(t, string(stored.ResponseCiphertext), "private answer")
 	require.NoError(t, model.ExpireRinOperationReceipts(db, time.Now().Add(time.Minute), time.Now().Add(time.Minute)))
 	assert.Equal(t, http.StatusGone, send(http.MethodPost, "op-one", requestBody).Code)
-	assert.Equal(t, 1, calls)
+	assert.Equal(t, 2, calls)
 }
 
 func TestRinReceiptQueryDistinguishesStoredFailureFromUnavailable(t *testing.T) {
