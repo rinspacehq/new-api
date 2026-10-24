@@ -120,6 +120,16 @@ func main() {
 
 	// 数据看板
 	go model.UpdateQuotaData()
+	if os.Getenv("RINSPACE_RIN_TOKEN_ID") != "" {
+		go func() {
+			for {
+				if err := middleware.ExpireOldRinReceipts(); err != nil {
+					common.SysError(common.LogText("rin receipt retention failed: %v", err))
+				}
+				time.Sleep(10 * time.Minute)
+			}
+		}()
+	}
 
 	if os.Getenv("CHANNEL_UPDATE_FREQUENCY") != "" {
 		frequency, err := strconv.Atoi(os.Getenv("CHANNEL_UPDATE_FREQUENCY"))
