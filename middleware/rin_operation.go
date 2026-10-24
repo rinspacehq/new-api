@@ -156,13 +156,62 @@ func RinOperationReceipt() gin.HandlerFunc {
 			return
 		}
 		var request struct {
-			Model     string `json:"model"`
-			Stream    bool   `json:"stream"`
-			MaxTokens int    `json:"max_tokens"`
+			Model       string  `json:"model"`
+			Stream      bool    `json:"stream"`
+			MaxTokens   int     `json:"max_tokens"`
+			Temperature float64 `json:"temperature"`
+			Thinking    struct {
+				Type string `json:"type"`
+			} `json:"thinking"`
+			Messages []struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"messages"`
 		}
-		if err := common.Unmarshal(body, &request); err != nil || request.Model != "deepseek-flash" || request.Stream || request.MaxTokens < 1 || request.MaxTokens > 4096 {
+		var fields map[string]any
+		if err := common.Unmarshal(body, &request); err != nil || common.Unmarshal(body, &fields) != nil ||
+			len(fields) != 6 || request.Model != "deepseek-flash" || request.Stream ||
+			request.MaxTokens < 1 || request.MaxTokens > 4096 ||
+			request.Temperature < 0 || request.Temperature > 2 ||
+			request.Thinking.Type != "disabled" || len(request.Messages) < 2 || len(request.Messages) > 16 {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rin chat request is invalid"})
 			return
+		}
+		_, validModel := fields["model"].(string)
+		_, validStream := fields["stream"].(bool)
+		_, validMaxTokens := fields["max_tokens"].(float64)
+		_, validTemperature := fields["temperature"].(float64)
+		if !validModel || !validStream || !validMaxTokens || !validTemperature {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rin chat request is invalid"})
+			return
+		}
+		for name := range fields {
+			switch name {
+			case "model", "messages", "stream", "max_tokens", "temperature", "thinking":
+			default:
+				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rin chat request is invalid"})
+				return
+			}
+		}
+		thinking, validThinking := fields["thinking"].(map[string]any)
+		rawMessages, validMessages := fields["messages"].([]any)
+		if !validThinking || len(thinking) != 1 || thinking["type"] != "disabled" ||
+			!validMessages || len(rawMessages) != len(request.Messages) {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rin chat request is invalid"})
+			return
+		}
+		for i, message := range request.Messages {
+			originalMessage, valid := rawMessages[i].(map[string]any)
+			if !valid || len(originalMessage) != 2 ||
+				originalMessage["role"] != message.Role || originalMessage["content"] != message.Content {
+				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rin chat request is invalid"})
+				return
+			}
+			if (message.Role != "system" && message.Role != "user" && message.Role != "assistant") ||
+				strings.TrimSpace(message.Content) == "" {
+				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rin chat request is invalid"})
+				return
+			}
 		}
 		c.Request.Body = io.NopCloser(bytes.NewReader(body))
 		hash := sha256.Sum256(body)

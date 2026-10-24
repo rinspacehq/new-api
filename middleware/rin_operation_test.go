@@ -155,7 +155,7 @@ func TestRinOperationReceiptNeverRepeatsModelCall(t *testing.T) {
 	engine.GET("/v1/rin/operations/:key", ReadRinOperationReceipt())
 	engine.POST("/v1/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
 
-	requestBody := `{"model":"deepseek-flash","stream":false,"max_tokens":100,"messages":[]}`
+	requestBody := `{"model":"deepseek-flash","stream":false,"max_tokens":100,"temperature":0.68,"thinking":{"type":"disabled"},"messages":[{"role":"system","content":"Rin"},{"role":"user","content":"hello"}]}`
 	send := func(method, key, body string) *httptest.ResponseRecorder {
 		request := httptest.NewRequest(method, "/v1/chat/completions", strings.NewReader(body))
 		if method == http.MethodGet {
@@ -183,6 +183,13 @@ func TestRinOperationReceiptNeverRepeatsModelCall(t *testing.T) {
 	engine.ServeHTTP(wrongRoute, httptest.NewRequest(http.MethodPost, "/v1/completions", nil))
 	assert.Equal(t, http.StatusForbidden, wrongRoute.Code)
 	assert.Equal(t, http.StatusConflict, send(http.MethodPost, "op-one", requestBody+" ").Code)
+	for key, invalid := range map[string]string{
+		"multiple-answers": requestBody[:len(requestBody)-1] + `,"n":2}`,
+		"null-stream":      strings.Replace(requestBody, `"stream":false`, `"stream":null`, 1),
+		"extra-message":    strings.Replace(requestBody, `"role":"user","content":"hello"`, `"role":"user","content":"hello","name":"other"`, 1),
+	} {
+		assert.Equal(t, http.StatusBadRequest, send(http.MethodPost, key, invalid).Code, key)
+	}
 	assert.Equal(t, 1, calls)
 
 	var stored model.RinOperation
@@ -214,7 +221,7 @@ func TestRinReceiptQueryDistinguishesStoredFailureFromUnavailable(t *testing.T) 
 	})
 	engine.GET("/v1/rin/operations/:key", ReadRinOperationReceipt())
 
-	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"deepseek-flash","stream":false,"max_tokens":100}`))
+	request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"deepseek-flash","stream":false,"max_tokens":100,"temperature":0.68,"thinking":{"type":"disabled"},"messages":[{"role":"system","content":"Rin"},{"role":"user","content":"hello"}]}`))
 	request.Header.Set(rinOperationHeader, "failed-one")
 	first := httptest.NewRecorder()
 	engine.ServeHTTP(first, request)

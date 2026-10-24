@@ -83,12 +83,8 @@ func CompleteRinOperation(db *gorm.DB, operationID uint64, status string, httpSt
 // unknown operations. Both remain as tombstones so their keys cannot call the
 // upstream model a second time.
 func ExpireRinOperationReceipts(db *gorm.DB, completedBefore, unknownBefore time.Time) error {
-	if err := db.Model(&RinOperation{}).
-		Where("status IN ? AND completed_at < ?", []string{RinOperationCompleted, RinOperationFailed}, completedBefore).
-		Updates(map[string]any{"status": RinOperationExpired, "response_ciphertext": nil}).Error; err != nil {
-		return err
-	}
 	return db.Model(&RinOperation{}).
-		Where("status = ? AND created_at < ?", RinOperationUnknown, unknownBefore).
-		Update("status", RinOperationExpired).Error
+		Where("(status IN ? AND completed_at < ?) OR (status = ? AND created_at < ?)",
+			[]string{RinOperationCompleted, RinOperationFailed}, completedBefore, RinOperationUnknown, unknownBefore).
+		Updates(map[string]any{"status": RinOperationExpired, "response_ciphertext": nil}).Error
 }
