@@ -220,14 +220,24 @@ func SearchUserTokens(userId int, keyword string, token string, offset int, limi
 }
 
 func ValidateUserToken(key string) (token *Token, err error) {
+	return validateUserToken(key, 0)
+}
+
+// ValidateRinReceiptToken permits only the dedicated Rin token to read or
+// abort its existing operations after its spending quota is exhausted.
+// Expiry, revocation and all other token checks still apply.
+func ValidateRinReceiptToken(key string, dedicatedID int) (token *Token, err error) {
+	return validateUserToken(key, dedicatedID)
+}
+
+func validateUserToken(key string, receiptTokenID int) (token *Token, err error) {
 	if key == "" {
 		return nil, ErrTokenNotProvided
 	}
 	token, err = GetTokenByKey(key, false)
 	if err == nil {
-		if token.Status == common.TokenStatusExhausted ||
-			token.Status == common.TokenStatusExpired ||
-			token.Status != common.TokenStatusEnabled {
+		if token.Status != common.TokenStatusEnabled &&
+			!(receiptTokenID > 0 && token.Id == receiptTokenID && token.Status == common.TokenStatusExhausted) {
 			return token, ErrTokenInvalid
 		}
 		if token.ExpiredTime != -1 && token.ExpiredTime < common.GetTimestamp() {
@@ -240,7 +250,7 @@ func ValidateUserToken(key string) (token *Token, err error) {
 			}
 			return token, ErrTokenInvalid
 		}
-		if !token.UnlimitedQuota && token.RemainQuota <= 0 {
+		if !token.UnlimitedQuota && token.RemainQuota <= 0 && token.Id != receiptTokenID {
 			if !common.RedisEnabled {
 				token.Status = common.TokenStatusExhausted
 				err := token.SelectUpdate()

@@ -573,7 +573,13 @@ func TokenAuth() func(c *gin.Context) {
 			parts = strings.Split(key, "-")
 			key = parts[0]
 		}
-		token, err := model.ValidateUserToken(key)
+		var token *model.Token
+		var err error
+		if rinReceiptControlRoute(c.Request.Method, c.Request.URL.Path) {
+			token, err = model.ValidateRinReceiptToken(key, rinTokenID())
+		} else {
+			token, err = model.ValidateUserToken(key)
+		}
 		if token != nil {
 			id := c.GetInt("id")
 			if id == 0 {

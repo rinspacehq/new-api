@@ -104,15 +104,31 @@ func rinTokenID() int {
 	return id
 }
 
-// RinTokenScope confines the dedicated service token to the two endpoints
-// needed by the Rin chat integration, even if its model limits are mis-set.
+// RinTokenScope confines the dedicated service token to the chat call and
+// receipt control endpoints, even if its model limits are mis-set.
+func rinReceiptControlRoute(method, path string) bool {
+	const prefix = "/v1/rin/operations/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	key := strings.TrimPrefix(path, prefix)
+	if method == http.MethodGet {
+		return key != "" && !strings.Contains(key, "/")
+	}
+	if method == http.MethodPost && strings.HasSuffix(key, "/abort") {
+		key = strings.TrimSuffix(key, "/abort")
+		return key != "" && !strings.Contains(key, "/")
+	}
+	return false
+}
+
 func rinTokenAllowed(tokenID int, method, path string) bool {
 	configured := rinTokenID()
 	if configured == 0 || tokenID != configured {
 		return true
 	}
 	return method == http.MethodPost && path == "/v1/chat/completions" ||
-		method == http.MethodGet && strings.HasPrefix(path, "/v1/rin/operations/")
+		rinReceiptControlRoute(method, path)
 }
 
 func RinTokenScope() gin.HandlerFunc {
@@ -312,6 +328,33 @@ func ReadRinOperationReceipt() gin.HandlerFunc {
 			} else {
 				c.AbortWithStatus(http.StatusServiceUnavailable)
 			}
+			return
+		}
+		writeRinOperationReceipt(c, aead, operation)
+	}
+}
+
+// AbortMissingRinOperation never changes a claimed call. A missing key is
+// tombstoned before the caller may release its reserved wallet funds.
+func AbortMissingRinOperation() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if rinTokenID() == 0 || c.GetInt("token_id") != rinTokenID() {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+		key := c.Param("key")
+		if len(key) == 0 || len(key) > 128 {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+		aead, err := rinReceiptCipher()
+		if err != nil {
+			c.AbortWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+		operation, err := model.AbortUnclaimedRinOperation(model.DB, c.GetInt("token_id"), key)
+		if err != nil {
+			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
 		}
 		writeRinOperationReceipt(c, aead, operation)

@@ -58,6 +58,28 @@ func ClaimRinOperation(db *gorm.DB, tokenID int, key, hash string) (RinOperation
 	return operation, false, nil
 }
 
+// AbortUnclaimedRinOperation atomically leaves a tombstone for a request that
+// has not crossed the gateway's claim boundary. A concurrent POST either wins
+// the claim, in which case its receipt is returned, or sees the tombstone and
+// must not call the upstream model.
+func AbortUnclaimedRinOperation(db *gorm.DB, tokenID int, key string) (RinOperation, error) {
+	if tokenID <= 0 || len(key) == 0 || len(key) > 128 {
+		return RinOperation{}, errors.New("invalid rin operation identity")
+	}
+	now := time.Now().UTC()
+	operation := RinOperation{
+		TokenID: tokenID, OperationKey: key, RequestHash: "", Status: RinOperationExpired,
+		HTTPStatus: 410, CompletedAt: &now,
+	}
+	if err := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&operation).Error; err != nil {
+		return RinOperation{}, err
+	}
+	if err := db.Where("token_id = ? AND operation_key = ?", tokenID, key).Take(&operation).Error; err != nil {
+		return RinOperation{}, err
+	}
+	return operation, nil
+}
+
 // CompleteRinOperation is compare-and-set: a duplicate or late writer cannot
 // replace a receipt once the operation has reached a terminal state.
 func CompleteRinOperation(db *gorm.DB, operationID uint64, status string, httpStatus int, ciphertext []byte) error {
