@@ -33,7 +33,6 @@ type rinReceiptWriter struct {
 	body     bytes.Buffer
 	status   int
 	tooLarge bool
-	flushed  bool
 }
 
 func (w *rinReceiptWriter) Header() http.Header  { return w.header }
@@ -51,7 +50,10 @@ func (w *rinReceiptWriter) Status() int {
 }
 func (w *rinReceiptWriter) Size() int     { return w.body.Len() }
 func (w *rinReceiptWriter) Written() bool { return w.status != 0 || w.body.Len() != 0 }
-func (w *rinReceiptWriter) Flush()        { w.flushed = true }
+
+// The relay flushes even complete non-streaming JSON responses. Keep it in the
+// receipt buffer until the operation has been committed to the database.
+func (w *rinReceiptWriter) Flush() {}
 func (w *rinReceiptWriter) Write(p []byte) (int, error) {
 	w.WriteHeaderNow()
 	if w.body.Len()+len(p) > rinReceiptLimit {
@@ -235,7 +237,8 @@ func RinOperationReceipt() gin.HandlerFunc {
 		c.Writer = captured
 		c.Next()
 		c.Writer = original
-		if captured.tooLarge || captured.flushed || captured.body.Len() == 0 {
+		if captured.tooLarge || captured.body.Len() == 0 ||
+			strings.HasPrefix(strings.ToLower(strings.TrimSpace(captured.header.Get("Content-Type"))), "text/event-stream") {
 			c.Data(http.StatusServiceUnavailable, "application/json", []byte(`{"error":"rin operation receipt is unavailable"}`))
 			return
 		}
