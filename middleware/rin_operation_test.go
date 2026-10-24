@@ -93,6 +93,15 @@ func testRinOperationStore(t *testing.T, db *gorm.DB) {
 	require.NoError(t, err)
 	assert.False(t, claimed, "an expired unknown operation must never call upstream again")
 	assert.Equal(t, model.RinOperationExpired, expiredUnknown.Status)
+	aborted, err := model.AbortUnclaimedRinOperation(operationDB(), 91, "rin-never-sent")
+	require.NoError(t, err)
+	assert.Equal(t, model.RinOperationExpired, aborted.Status)
+	repeatedAbort, err := model.AbortUnclaimedRinOperation(operationDB(), 91, "rin-never-sent")
+	require.NoError(t, err)
+	assert.Equal(t, aborted.ID, repeatedAbort.ID)
+	_, claimed, err = model.ClaimRinOperation(operationDB(), 91, "rin-never-sent", hash)
+	require.ErrorIs(t, err, model.ErrRinOperationConflict)
+	assert.False(t, claimed, "a late request must not call the provider")
 }
 
 func TestRinOperationStoreSQLite(t *testing.T) {
@@ -118,6 +127,9 @@ func TestRinDedicatedTokenCannotUseOtherTokenRoutes(t *testing.T) {
 	assert.True(t, rinTokenAllowed(91, http.MethodPost, "/v1/chat/completions"))
 	assert.True(t, rinTokenAllowed(91, http.MethodGet, "/v1/rin/operations/op-one"))
 	assert.False(t, rinTokenAllowed(91, http.MethodPost, "/v1/rin/operations/op-one"))
+	assert.True(t, rinTokenAllowed(91, http.MethodPost, "/v1/rin/operations/op-one/abort"))
+	assert.False(t, rinTokenAllowed(91, http.MethodGet, "/v1/rin/operations/op-one/abort"))
+	assert.False(t, rinTokenAllowed(91, http.MethodPost, "/v1/rin/operations/op-one/abort/extra"))
 }
 
 func TestRinOperationStorePostgreSQL(t *testing.T) {
@@ -160,6 +172,7 @@ func TestRinOperationReceiptNeverRepeatsModelCall(t *testing.T) {
 		c.Writer.Flush() // Matches the normal relay's final flush after JSON.
 	})
 	engine.GET("/v1/rin/operations/:key", ReadRinOperationReceipt())
+	engine.POST("/v1/rin/operations/:key/abort", AbortMissingRinOperation())
 	engine.POST("/v1/completions", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	requestBody := `{"model":"deepseek-flash","stream":false,"max_tokens":100,"temperature":0.68,"thinking":{"type":"disabled"},"messages":[{"role":"system","content":"Rin"},{"role":"user","content":"hello"}]}`
@@ -182,7 +195,17 @@ func TestRinOperationReceiptNeverRepeatsModelCall(t *testing.T) {
 	queried := send(http.MethodGet, "op-one", "")
 	assert.Equal(t, first.Body.String(), queried.Body.String())
 	assert.Equal(t, model.RinOperationCompleted, queried.Header().Get(rinOperationStatusHeader))
+	abortedCompleted := httptest.NewRecorder()
+	engine.ServeHTTP(abortedCompleted, httptest.NewRequest(http.MethodPost, "/v1/rin/operations/op-one/abort", nil))
+	assert.Equal(t, first.Body.String(), abortedCompleted.Body.String())
+	assert.Equal(t, model.RinOperationCompleted, abortedCompleted.Header().Get(rinOperationStatusHeader))
 	assert.Equal(t, 1, calls)
+	abortedMissing := httptest.NewRecorder()
+	engine.ServeHTTP(abortedMissing, httptest.NewRequest(http.MethodPost, "/v1/rin/operations/not-sent/abort", nil))
+	assert.Equal(t, http.StatusGone, abortedMissing.Code)
+	assert.Equal(t, model.RinOperationExpired, abortedMissing.Header().Get(rinOperationStatusHeader))
+	assert.Equal(t, http.StatusConflict, send(http.MethodPost, "not-sent", requestBody).Code)
+	assert.Equal(t, 1, calls, "a late request must not call the model")
 	withoutKey := httptest.NewRecorder()
 	engine.ServeHTTP(withoutKey, httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(requestBody)))
 	assert.Equal(t, http.StatusBadRequest, withoutKey.Code)
@@ -201,6 +224,10 @@ func TestRinOperationReceiptNeverRepeatsModelCall(t *testing.T) {
 	stream := send(http.MethodPost, "op-stream", requestBody)
 	assert.Equal(t, http.StatusServiceUnavailable, stream.Code)
 	assert.Equal(t, model.RinOperationUnknown, send(http.MethodGet, "op-stream", "").Header().Get(rinOperationStatusHeader))
+	abortedUnknown := httptest.NewRecorder()
+	engine.ServeHTTP(abortedUnknown, httptest.NewRequest(http.MethodPost, "/v1/rin/operations/op-stream/abort", nil))
+	assert.Equal(t, http.StatusAccepted, abortedUnknown.Code)
+	assert.Equal(t, model.RinOperationUnknown, abortedUnknown.Header().Get(rinOperationStatusHeader))
 	assert.Equal(t, 2, calls)
 
 	var stored model.RinOperation

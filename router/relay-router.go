@@ -78,6 +78,7 @@ func SetRelayRouter(router *gin.Engine) {
 		// response.create event; each event runs the ordinary request limiter.
 		relayV1Router.GET("/responses", controller.ResponsesWebSocket)
 		relayV1Router.GET("/rin/operations/:key", middleware.ReadRinOperationReceipt())
+		relayV1Router.POST("/rin/operations/:key/abort", middleware.AbortMissingRinOperation())
 	}
 	relayV1Router.Use(middleware.RinOperationReceipt())
 	relayV1Router.Use(middleware.ModelRequestRateLimit())
