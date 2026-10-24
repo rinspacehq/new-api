@@ -42,6 +42,7 @@ jobs:
           git fetch origin main
           git merge-base --is-ancestor "$SOURCE_SHA" FETCH_HEAD
           test "$(git remote get-url origin)" = 'https://github.com/rinspacehq/new-api'
+          printf 'rin-%s\n' "${SOURCE_SHA:0:12}" > VERSION
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
