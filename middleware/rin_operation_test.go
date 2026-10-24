@@ -93,6 +93,15 @@ func testRinOperationStore(t *testing.T, db *gorm.DB) {
 	require.NoError(t, err)
 	assert.False(t, claimed, "an expired unknown operation must never call upstream again")
 	assert.Equal(t, model.RinOperationExpired, expiredUnknown.Status)
+	aborted, err := model.AbortUnclaimedRinOperation(operationDB(), 91, "rin-never-sent")
+	require.NoError(t, err)
+	assert.Equal(t, model.RinOperationExpired, aborted.Status)
+	repeatedAbort, err := model.AbortUnclaimedRinOperation(operationDB(), 91, "rin-never-sent")
+	require.NoError(t, err)
+	assert.Equal(t, aborted.ID, repeatedAbort.ID)
+	_, claimed, err = model.ClaimRinOperation(operationDB(), 91, "rin-never-sent", hash)
+	require.ErrorIs(t, err, model.ErrRinOperationConflict)
+	assert.False(t, claimed, "a late request must not call the provider")
 }
 
 func TestRinOperationStoreSQLite(t *testing.T) {
