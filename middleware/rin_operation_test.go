@@ -238,6 +238,73 @@ func TestRinOperationReceiptNeverRepeatsModelCall(t *testing.T) {
 	assert.Equal(t, 2, calls)
 }
 
+func TestRinOperationReceiptAcceptsAgentToolProtocol(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := gorm.Open(sqlite.Open("file:rin_agent_receipts?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.RinOperation{}))
+	previous := model.DB
+	model.DB = db
+	t.Cleanup(func() { model.DB = previous })
+	t.Setenv("RINSPACE_RIN_TOKEN_ID", "91")
+	t.Setenv("RINSPACE_RIN_RECEIPT_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32)))
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) { c.Set("token_id", 91); c.Next() })
+	engine.Use(RinTokenScope(), RinOperationReceipt())
+	calls := 0
+	engine.POST("/v1/chat/completions", func(c *gin.Context) {
+		calls++
+		c.JSON(http.StatusOK, gin.H{
+			"id": "provider-agent-1", "model": "deepseek-flash",
+			"choices": []gin.H{{
+				"message": gin.H{"role": "assistant", "content": "", "tool_calls": []gin.H{{
+					"id": "call-1", "type": "function",
+					"function": gin.H{"name": "read_project_files", "arguments": `{"path":"main.tex"}`},
+				}}},
+				"finish_reason": "tool_calls",
+			}},
+			"usage": gin.H{"prompt_tokens": 20, "completion_tokens": 4, "prompt_cache_hit_tokens": 5, "prompt_cache_miss_tokens": 15},
+		})
+	})
+	engine.GET("/v1/rin/operations/:key", ReadRinOperationReceipt())
+
+	tool := `{"type":"function","function":{"name":"read_project_files","description":"Read one project file.","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}}}`
+	initial := `{"model":"deepseek-flash","messages":[{"role":"system","content":"Use only declared tools."},{"role":"user","content":"Read main.tex."}],"tools":[` + tool + `],"tool_choice":"auto","stream":false,"max_tokens":16,"temperature":0.2,"thinking":{"type":"disabled"}}`
+	send := func(key, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		request.Header.Set(rinOperationHeader, key)
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		return response
+	}
+	first := send("agent-one", initial)
+	require.Equal(t, http.StatusOK, first.Code)
+	assert.Equal(t, model.RinOperationCompleted, first.Header().Get(rinOperationStatusHeader))
+	assert.Contains(t, first.Body.String(), "call-1")
+	assert.Equal(t, first.Body.String(), send("agent-one", initial).Body.String())
+	receipt := httptest.NewRecorder()
+	engine.ServeHTTP(receipt, httptest.NewRequest(http.MethodGet, "/v1/rin/operations/agent-one", nil))
+	assert.Equal(t, first.Body.String(), receipt.Body.String())
+	assert.Equal(t, 1, calls)
+
+	continued := `{"model":"deepseek-flash","messages":[{"role":"system","content":"Use only declared tools."},{"role":"user","content":"Read main.tex."},{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"read_project_files","arguments":"{\"path\":\"main.tex\"}"}}]},{"role":"tool","content":"file contents","tool_call_id":"call-1"}],"tools":[` + tool + `],"tool_choice":"auto","stream":false,"max_tokens":16,"temperature":0.2,"thinking":{"type":"disabled"}}`
+	assert.Equal(t, http.StatusOK, send("agent-two", continued).Code)
+	assert.Equal(t, 2, calls)
+
+	for key, invalid := range map[string]string{
+		"agent-extra-field": strings.TrimSuffix(initial, "}") + `,"n":2}`,
+		"agent-bad-schema":  strings.Replace(initial, `"parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false}`, `"parameters":[]`, 1),
+		"agent-bad-tool":    strings.Replace(initial, `"name":"read_project_files"`, `"name":"read.project"`, 1),
+		"agent-orphan-result": strings.Replace(initial,
+			`{"role":"user","content":"Read main.tex."}`,
+			`{"role":"tool","content":"file contents","tool_call_id":"missing"}`, 1),
+		"agent-over-limit": strings.Replace(initial, `"max_tokens":16`, `"max_tokens":4097`, 1),
+	} {
+		assert.Equal(t, http.StatusBadRequest, send(key, invalid).Code, key)
+	}
+	assert.Equal(t, 2, calls, "invalid agent requests must not reach the provider")
+}
+
 func TestRinReceiptQueryDistinguishesStoredFailureFromUnavailable(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	db, err := gorm.Open(sqlite.Open("file:rin_failed_receipts?mode=memory&cache=shared"), &gorm.Config{})

@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
@@ -26,6 +28,54 @@ import (
 const rinOperationHeader = "X-Rinspace-Operation-Key"
 const rinOperationStatusHeader = "X-Rinspace-Operation-Status"
 const rinReceiptLimit = 1 << 20
+
+const (
+	rinAgentMessageLimit = 96
+	rinAgentToolLimit    = 32
+	rinAgentContentLimit = 64 << 10
+)
+
+type rinOperationRequest struct {
+	Model       string                `json:"model"`
+	Messages    []rinOperationMessage `json:"messages"`
+	Tools       []rinOperationTool    `json:"tools"`
+	ToolChoice  string                `json:"tool_choice"`
+	Stream      bool                  `json:"stream"`
+	MaxTokens   int                   `json:"max_tokens"`
+	Temperature float64               `json:"temperature"`
+	Thinking    struct {
+		Type string `json:"type"`
+	} `json:"thinking"`
+}
+
+type rinOperationMessage struct {
+	Role       string                 `json:"role"`
+	Content    string                 `json:"content"`
+	ToolCallID string                 `json:"tool_call_id"`
+	ToolCalls  []rinOperationToolCall `json:"tool_calls"`
+}
+
+type rinOperationTool struct {
+	Type     string                         `json:"type"`
+	Function rinOperationFunctionDefinition `json:"function"`
+}
+
+type rinOperationFunctionDefinition struct {
+	Name        string          `json:"name"`
+	Description string          `json:"description"`
+	Parameters  json.RawMessage `json:"parameters"`
+}
+
+type rinOperationToolCall struct {
+	ID       string                   `json:"id"`
+	Type     string                   `json:"type"`
+	Function rinOperationFunctionCall `json:"function"`
+}
+
+type rinOperationFunctionCall struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
 
 type rinReceiptWriter struct {
 	gin.ResponseWriter
@@ -104,6 +154,219 @@ func rinTokenID() int {
 	return id
 }
 
+func rinExactFields(fields map[string]any, names ...string) bool {
+	if len(fields) != len(names) {
+		return false
+	}
+	for _, name := range names {
+		if _, exists := fields[name]; !exists {
+			return false
+		}
+	}
+	return true
+}
+
+func rinAgentName(value string) bool {
+	if len(value) == 0 || len(value) > 64 {
+		return false
+	}
+	for _, char := range value {
+		if !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' ||
+			char >= '0' && char <= '9' || char == '_' || char == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func rinAgentCallID(value string) bool {
+	const limit = 128
+	if len(value) == 0 || len(value) > limit {
+		return false
+	}
+	for _, char := range value {
+		if !(char >= 'a' && char <= 'z' || char >= 'A' && char <= 'Z' ||
+			char >= '0' && char <= '9' || char == '_' || char == '-' || char == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+func rinJSONObject(raw []byte) bool {
+	var value map[string]any
+	return len(raw) > 0 && common.Unmarshal(raw, &value) == nil && value != nil
+}
+
+func validRinChatRequest(body []byte, fields map[string]any) bool {
+	var request rinOperationRequest
+	if common.Unmarshal(body, &request) != nil ||
+		!rinExactFields(fields, "model", "messages", "stream", "max_tokens", "temperature", "thinking") ||
+		request.Model != "deepseek-flash" || request.Stream ||
+		request.MaxTokens < 1 || request.MaxTokens > 4096 ||
+		request.Temperature < 0 || request.Temperature > 2 ||
+		request.Thinking.Type != "disabled" || len(request.Messages) < 2 || len(request.Messages) > 16 {
+		return false
+	}
+	_, validModel := fields["model"].(string)
+	_, validStream := fields["stream"].(bool)
+	_, validMaxTokens := fields["max_tokens"].(float64)
+	_, validTemperature := fields["temperature"].(float64)
+	thinking, validThinking := fields["thinking"].(map[string]any)
+	rawMessages, validMessages := fields["messages"].([]any)
+	if !validModel || !validStream || !validMaxTokens || !validTemperature ||
+		!validThinking || !rinExactFields(thinking, "type") || thinking["type"] != "disabled" ||
+		!validMessages || len(rawMessages) != len(request.Messages) {
+		return false
+	}
+	for i, message := range request.Messages {
+		original, valid := rawMessages[i].(map[string]any)
+		if !valid || !rinExactFields(original, "role", "content") ||
+			original["role"] != message.Role || original["content"] != message.Content ||
+			(message.Role != "system" && message.Role != "user" && message.Role != "assistant") ||
+			strings.TrimSpace(message.Content) == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func validRinAgentRequest(body []byte, fields map[string]any) bool {
+	var request rinOperationRequest
+	if common.Unmarshal(body, &request) != nil ||
+		!rinExactFields(fields, "model", "messages", "tools", "tool_choice", "stream", "max_tokens", "temperature", "thinking") ||
+		request.Model != "deepseek-flash" || request.ToolChoice != "auto" || request.Stream ||
+		request.MaxTokens < 1 || request.MaxTokens > 4096 ||
+		request.Temperature < 0 || request.Temperature > 2 ||
+		request.Thinking.Type != "disabled" || len(request.Messages) == 0 || len(request.Messages) > rinAgentMessageLimit ||
+		len(request.Tools) == 0 || len(request.Tools) > rinAgentToolLimit {
+		return false
+	}
+	_, validModel := fields["model"].(string)
+	_, validToolChoice := fields["tool_choice"].(string)
+	_, validStream := fields["stream"].(bool)
+	_, validMaxTokens := fields["max_tokens"].(float64)
+	_, validTemperature := fields["temperature"].(float64)
+	thinking, validThinking := fields["thinking"].(map[string]any)
+	rawMessages, validMessages := fields["messages"].([]any)
+	rawTools, validTools := fields["tools"].([]any)
+	if !validModel || !validToolChoice || !validStream || !validMaxTokens || !validTemperature ||
+		!validThinking || !rinExactFields(thinking, "type") || thinking["type"] != "disabled" ||
+		!validMessages || len(rawMessages) != len(request.Messages) ||
+		!validTools || len(rawTools) != len(request.Tools) {
+		return false
+	}
+	declaredTools := make(map[string]struct{}, len(request.Tools))
+	for i, tool := range request.Tools {
+		original, valid := rawTools[i].(map[string]any)
+		function, validFunction := original["function"].(map[string]any)
+		functionName, validName := function["name"].(string)
+		description, validDescription := function["description"].(string)
+		_, validParameters := function["parameters"].(map[string]any)
+		if !valid || !rinExactFields(original, "type", "function") ||
+			!validFunction || !rinExactFields(function, "name", "description", "parameters") ||
+			!validName || functionName != tool.Function.Name ||
+			!validDescription || description != tool.Function.Description || !validParameters ||
+			original["type"] != "function" || tool.Type != "function" ||
+			!rinAgentName(tool.Function.Name) || len(tool.Function.Description) > 4096 ||
+			!utf8.ValidString(tool.Function.Description) || len(tool.Function.Parameters) > rinAgentContentLimit ||
+			!rinJSONObject(tool.Function.Parameters) {
+			return false
+		}
+		if _, exists := declaredTools[tool.Function.Name]; exists {
+			return false
+		}
+		declaredTools[tool.Function.Name] = struct{}{}
+	}
+	pendingCalls := make(map[string]struct{})
+	seenCalls := make(map[string]struct{})
+	for i, message := range request.Messages {
+		original, valid := rawMessages[i].(map[string]any)
+		role, validRole := original["role"].(string)
+		if !valid || len(message.Content) > rinAgentContentLimit || !utf8.ValidString(message.Content) ||
+			!validRole || role != message.Role {
+			return false
+		}
+		switch message.Role {
+		case "system", "user":
+			content, validContent := original["content"].(string)
+			if !rinExactFields(original, "role", "content") || !validContent || content != message.Content ||
+				strings.TrimSpace(message.Content) == "" ||
+				(message.Role == "system" && i != 0) || (message.Role == "user" && len(pendingCalls) != 0) {
+				return false
+			}
+		case "assistant":
+			if len(pendingCalls) != 0 || strings.TrimSpace(message.Content) == "" && len(message.ToolCalls) == 0 ||
+				!(rinExactFields(original, "role", "content") || rinExactFields(original, "role", "tool_calls") ||
+					rinExactFields(original, "role", "content", "tool_calls")) {
+				return false
+			}
+			if rawContent, hasContent := original["content"]; hasContent {
+				content, validContent := rawContent.(string)
+				if !validContent || content != message.Content {
+					return false
+				}
+			}
+			rawCalls, validCalls := original["tool_calls"].([]any)
+			if _, hasCalls := original["tool_calls"]; hasCalls &&
+				(!validCalls || len(rawCalls) == 0 || len(rawCalls) != len(message.ToolCalls) || len(rawCalls) > rinAgentToolLimit) {
+				return false
+			}
+			for callIndex, call := range message.ToolCalls {
+				rawCall, validCall := rawCalls[callIndex].(map[string]any)
+				rawFunction, validFunction := rawCall["function"].(map[string]any)
+				var arguments map[string]any
+				if !validCall || !rinExactFields(rawCall, "id", "type", "function") ||
+					!validFunction || !rinExactFields(rawFunction, "name", "arguments") ||
+					call.Type != "function" || !rinAgentCallID(call.ID) ||
+					!rinAgentName(call.Function.Name) || len(call.Function.Arguments) == 0 ||
+					len(call.Function.Arguments) > rinAgentContentLimit ||
+					common.Unmarshal([]byte(call.Function.Arguments), &arguments) != nil || arguments == nil {
+					return false
+				}
+				if _, declared := declaredTools[call.Function.Name]; !declared {
+					return false
+				}
+				if _, seen := seenCalls[call.ID]; seen {
+					return false
+				}
+				seenCalls[call.ID] = struct{}{}
+				pendingCalls[call.ID] = struct{}{}
+			}
+		case "tool":
+			content, validContent := original["content"].(string)
+			toolCallID, validToolCallID := original["tool_call_id"].(string)
+			if !rinExactFields(original, "role", "content", "tool_call_id") ||
+				!validContent || content != message.Content || !validToolCallID || toolCallID != message.ToolCallID ||
+				strings.TrimSpace(message.Content) == "" || !rinAgentCallID(message.ToolCallID) {
+				return false
+			}
+			if _, pending := pendingCalls[message.ToolCallID]; !pending {
+				return false
+			}
+			delete(pendingCalls, message.ToolCallID)
+		default:
+			return false
+		}
+		if i == 0 && message.Role != "system" {
+			return false
+		}
+	}
+	lastRole := request.Messages[len(request.Messages)-1].Role
+	return len(pendingCalls) == 0 && (lastRole == "user" || lastRole == "tool")
+}
+
+func validRinOperationRequest(body []byte) bool {
+	var fields map[string]any
+	if common.Unmarshal(body, &fields) != nil || fields == nil {
+		return false
+	}
+	if _, isAgent := fields["tools"]; isAgent {
+		return validRinAgentRequest(body, fields)
+	}
+	return validRinChatRequest(body, fields)
+}
+
 // RinTokenScope confines the dedicated service token to the chat call and
 // receipt control endpoints, even if its model limits are mis-set.
 func rinReceiptControlRoute(method, path string) bool {
@@ -173,63 +436,9 @@ func RinOperationReceipt() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": "rin request is too large"})
 			return
 		}
-		var request struct {
-			Model       string  `json:"model"`
-			Stream      bool    `json:"stream"`
-			MaxTokens   int     `json:"max_tokens"`
-			Temperature float64 `json:"temperature"`
-			Thinking    struct {
-				Type string `json:"type"`
-			} `json:"thinking"`
-			Messages []struct {
-				Role    string `json:"role"`
-				Content string `json:"content"`
-			} `json:"messages"`
-		}
-		var fields map[string]any
-		if err := common.Unmarshal(body, &request); err != nil || common.Unmarshal(body, &fields) != nil ||
-			len(fields) != 6 || request.Model != "deepseek-flash" || request.Stream ||
-			request.MaxTokens < 1 || request.MaxTokens > 4096 ||
-			request.Temperature < 0 || request.Temperature > 2 ||
-			request.Thinking.Type != "disabled" || len(request.Messages) < 2 || len(request.Messages) > 16 {
+		if !validRinOperationRequest(body) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rin chat request is invalid"})
 			return
-		}
-		_, validModel := fields["model"].(string)
-		_, validStream := fields["stream"].(bool)
-		_, validMaxTokens := fields["max_tokens"].(float64)
-		_, validTemperature := fields["temperature"].(float64)
-		if !validModel || !validStream || !validMaxTokens || !validTemperature {
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rin chat request is invalid"})
-			return
-		}
-		for name := range fields {
-			switch name {
-			case "model", "messages", "stream", "max_tokens", "temperature", "thinking":
-			default:
-				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rin chat request is invalid"})
-				return
-			}
-		}
-		thinking, validThinking := fields["thinking"].(map[string]any)
-		rawMessages, validMessages := fields["messages"].([]any)
-		if !validThinking || len(thinking) != 1 || thinking["type"] != "disabled" ||
-			!validMessages || len(rawMessages) != len(request.Messages) {
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rin chat request is invalid"})
-			return
-		}
-		for i, message := range request.Messages {
-			originalMessage, valid := rawMessages[i].(map[string]any)
-			if !valid || len(originalMessage) != 2 ||
-				originalMessage["role"] != message.Role || originalMessage["content"] != message.Content {
-				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rin chat request is invalid"})
-				return
-			}
-			if (message.Role != "system" && message.Role != "user" && message.Role != "assistant") ||
-				strings.TrimSpace(message.Content) == "" {
-				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rin chat request is invalid"})
-				return
-			}
 		}
 		c.Request.Body = io.NopCloser(bytes.NewReader(body))
 		hash := sha256.Sum256(body)
