@@ -359,3 +359,28 @@ If this project is helpful to you, welcome to give us a ⭐️ Star！
 <sub>Built with ❤️ by QuantumNous</sub>
 
 </div>
+
+### Rin service receipt budgets
+
+The Rin receipt extension accepts `X-Rinspace-Budget-Profile` only with its
+configured dedicated service token and operation key. This is a service transport
+ceiling; account admission, actual budgets and payment policy belong to the host.
+
+| Profile | Request | Messages / message bytes | Output ceiling | Stored response |
+| --- | --- | --- | --- | --- |
+| Header absent (legacy) | 1 MiB | 96 / 64 KiB | 4096 tokens | 1 MiB |
+| `rin-agent/v2` | 1 MiB | 96 / 64 KiB | 393216 tokens | 4 MiB |
+| `reader-learning/v1` | 8 MiB | 256 / 1 MiB | 65536 tokens | 4 MiB |
+
+Function schemas remain limited to 64 KiB and 32 declared functions. Plain chat
+retains its separate 16-message shape. Existing relay max-token validation and
+quota calculation still apply. Unknown, duplicate or unauthorized profile headers
+are rejected; the internal header is removed before relay. New profile names are
+part of the durable request hash, so the same operation cannot change its budget
+on retry. Legacy request hashes and receipt lookups remain compatible. Oversized
+responses stay unresolved and do not trigger another upstream invocation.
+
+`go test ./middleware -run '^TestRin'` covers service scope, byte/token boundaries,
+private encrypted receipt recovery and idempotency. Optional `TEST_POSTGRES_DSN`
+and `TEST_MYSQL_DSN` run the same binary-column/migration/replay checks on disposable
+real databases; use empty isolated test databases, never product databases.

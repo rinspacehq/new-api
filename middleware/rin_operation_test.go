@@ -12,17 +12,40 @@ import (
 	"testing"
 	"time"
 
+	"github.com/QuantumNous/new-api/common"
 	"github.com/QuantumNous/new-api/model"
 	"github.com/gin-gonic/gin"
 	"github.com/glebarez/sqlite"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
+// This is the released receipt schema before learning-scoped content cleanup.
+// Exercise real upgrades, rather than only migrating the new model twice.
+type releasedRinOperation struct {
+	ID                 uint64 `gorm:"primaryKey"`
+	TokenID            int    `gorm:"uniqueIndex:idx_rin_operation_token_key;not null"`
+	OperationKey       string `gorm:"size:128;uniqueIndex:idx_rin_operation_token_key;not null"`
+	RequestHash        string `gorm:"size:64;not null"`
+	Status             string `gorm:"size:16;not null;index:idx_rin_operation_status_created,priority:1"`
+	HTTPStatus         int
+	ResponseCiphertext []byte
+	CreatedAt          time.Time `gorm:"index:idx_rin_operation_status_created,priority:2"`
+	CompletedAt        *time.Time
+}
+
 func testRinOperationStore(t *testing.T, db *gorm.DB) {
 	t.Helper()
+	versionQuery := "SELECT version()"
+	if db.Dialector.Name() == "sqlite" {
+		versionQuery = "SELECT sqlite_version()"
+	}
+	var databaseVersion string
+	require.NoError(t, db.Raw(versionQuery).Scan(&databaseVersion).Error)
+	t.Logf("real database: %s %s", db.Dialector.Name(), databaseVersion)
 	table := fmt.Sprintf("rin_operation_test_%d", time.Now().UnixNano())
 	legacyTable := fmt.Sprintf("rin_legacy_token_%d", time.Now().UnixNano())
 	legacyDB := db.Session(&gorm.Session{NewDB: true}).Table(legacyTable)
@@ -30,10 +53,22 @@ func testRinOperationStore(t *testing.T, db *gorm.DB) {
 	require.NoError(t, legacyDB.Create(&model.Token{UserId: 91, Key: "legacy-rin-token"}).Error)
 	t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(legacyTable)) })
 	tableDB := db.Table(table)
+	require.NoError(t, tableDB.AutoMigrate(&releasedRinOperation{}))
+	completed := time.Now().UTC().Truncate(time.Millisecond)
+	legacyReceipt := releasedRinOperation{TokenID: 91, OperationKey: "released-private-receipt", RequestHash: strings.Repeat("a", 64),
+		Status: model.RinOperationCompleted, HTTPStatus: 200, ResponseCiphertext: []byte("original released encrypted receipt"), CompletedAt: &completed}
+	require.NoError(t, tableDB.Create(&legacyReceipt).Error)
 	require.NoError(t, tableDB.AutoMigrate(&model.RinOperation{}))
+	require.NoError(t, tableDB.AutoMigrate(&model.RinOperation{}))
+	var upgraded model.RinOperation
+	require.NoError(t, tableDB.Where("id = ?", legacyReceipt.ID).Take(&upgraded).Error)
+	assert.Equal(t, legacyReceipt.RequestHash, upgraded.RequestHash)
+	assert.Equal(t, legacyReceipt.ResponseCiphertext, upgraded.ResponseCiphertext)
+	assert.Empty(t, upgraded.BudgetProfile)
+	assert.Nil(t, upgraded.ContentPurgedAt)
 	t.Cleanup(func() { require.NoError(t, db.Migrator().DropTable(table)) })
 	var legacy model.Token
-	require.NoError(t, db.Session(&gorm.Session{NewDB: true}).Table(legacyTable).Where("key = ?", "legacy-rin-token").Take(&legacy).Error)
+	require.NoError(t, db.Session(&gorm.Session{NewDB: true}).Table(legacyTable).Where(map[string]any{"key": "legacy-rin-token"}).Take(&legacy).Error)
 	assert.Equal(t, 91, legacy.UserId, "upgrading must preserve existing token data")
 	operationDB := func() *gorm.DB { return db.Session(&gorm.Session{NewDB: true}).Table(table) }
 
@@ -61,7 +96,9 @@ func testRinOperationStore(t *testing.T, db *gorm.DB) {
 	require.NoError(t, err)
 	assert.True(t, claimed)
 
-	answer := []byte("encrypted answer")
+	// The new bounded profile retains complete large private responses. Exercise
+	// the actual binary column through migration/replay on every supported DB.
+	answer := bytes.Repeat([]byte("original-synthetic-receipt"), 90000)
 	require.NoError(t, model.CompleteRinOperation(operationDB(), operations[0].ID, model.RinOperationCompleted, 200, answer))
 	require.Error(t, model.CompleteRinOperation(operationDB(), operations[0].ID, model.RinOperationCompleted, 200, []byte("replacement")))
 	stored, claimed, err := model.ClaimRinOperation(operationDB(), 91, "rin-01", hash)
@@ -74,8 +111,34 @@ func testRinOperationStore(t *testing.T, db *gorm.DB) {
 	require.NoError(t, operationDB().Where("token_id = ? AND operation_key = ?", 91, "rin-01").Take(&stored).Error)
 	assert.Equal(t, model.RinOperationCompleted, stored.Status)
 	assert.True(t, bytes.Equal(answer, stored.ResponseCiphertext))
-	require.NoError(t, legacyDB.Where("key = ?", "legacy-rin-token").Take(&legacy).Error)
+	require.NoError(t, legacyDB.Where(map[string]any{"key": "legacy-rin-token"}).Take(&legacy).Error)
 	assert.Equal(t, 91, legacy.UserId)
+
+	learning, claimed, err := model.ClaimRinOperationWithProfile(operationDB(), 91, "learning-private", hash, "reader-learning/v1")
+	require.NoError(t, err)
+	assert.True(t, claimed)
+	require.ErrorIs(t, model.PurgeRinLearningReceiptContent(operationDB(), 91, "learning-private"), model.ErrRinOperationPending)
+	require.ErrorIs(t, model.PurgeRinLearningReceiptContent(operationDB(), 92, "learning-private"), gorm.ErrRecordNotFound)
+	require.ErrorIs(t, model.PurgeRinLearningReceiptContent(operationDB(), 91, "released-private-receipt"), gorm.ErrRecordNotFound)
+	require.NoError(t, model.CompleteRinOperation(operationDB(), learning.ID, model.RinOperationCompleted, 200, []byte("private learning receipt")))
+	require.NoError(t, model.PurgeRinLearningReceiptContent(operationDB(), 91, "learning-private"))
+	cleaned, claimed, err := model.ClaimRinOperationWithProfile(operationDB(), 91, "learning-private", hash, "reader-learning/v1")
+	require.NoError(t, err)
+	assert.False(t, claimed, "purging content must never release the original provider key")
+	assert.Equal(t, model.RinOperationCompleted, cleaned.Status)
+	assert.Equal(t, hash, cleaned.RequestHash)
+	assert.Equal(t, 200, cleaned.HTTPStatus)
+	assert.Empty(t, cleaned.ResponseCiphertext)
+	require.NotNil(t, cleaned.ContentPurgedAt)
+	require.NoError(t, model.PurgeRinLearningReceiptContent(operationDB(), 91, "learning-private"))
+	require.Error(t, model.CompleteRinOperation(operationDB(), learning.ID, model.RinOperationCompleted, 200, []byte("late replacement")))
+	_, _, err = model.ClaimRinOperationWithProfile(operationDB(), 91, "learning-private", hash, "rin-agent/v2")
+	require.ErrorIs(t, err, model.ErrRinOperationConflict)
+	require.NoError(t, tableDB.AutoMigrate(&model.RinOperation{}))
+	var after model.RinOperation
+	require.NoError(t, operationDB().Where("id = ?", cleaned.ID).Take(&after).Error)
+	assert.Equal(t, cleaned.ContentPurgedAt, after.ContentPurgedAt)
+	assert.Empty(t, after.ResponseCiphertext)
 
 	require.NoError(t, model.ExpireRinOperationReceipts(operationDB(), time.Now().Add(time.Minute), time.Now().Add(-time.Minute)))
 	stillUnknown, claimed, err := model.ClaimRinOperation(operationDB(), 92, "rin-01", hash)
@@ -138,6 +201,16 @@ func TestRinOperationStorePostgreSQL(t *testing.T) {
 		t.Skip("TEST_POSTGRES_DSN is not configured")
 	}
 	db, err := gorm.Open(postgres.Open(dsn), &gorm.Config{})
+	require.NoError(t, err)
+	testRinOperationStore(t, db)
+}
+
+func TestRinOperationStoreMySQL(t *testing.T) {
+	dsn := strings.TrimSpace(os.Getenv("TEST_MYSQL_DSN"))
+	if dsn == "" {
+		t.Skip("TEST_MYSQL_DSN is not configured")
+	}
+	db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{})
 	require.NoError(t, err)
 	testRinOperationStore(t, db)
 }
@@ -344,4 +417,110 @@ func TestRinReceiptQueryDistinguishesStoredFailureFromUnavailable(t *testing.T) 
 	engine.ServeHTTP(unavailable, httptest.NewRequest(http.MethodGet, "/v1/rin/operations/failed-one", nil))
 	assert.Equal(t, http.StatusServiceUnavailable, unavailable.Code)
 	assert.Empty(t, unavailable.Header().Get(rinOperationStatusHeader))
+}
+
+func TestRinBudgetProfilesBindReplayAndRemainServiceScoped(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	db, err := gorm.Open(sqlite.Open("file:rin_budget_profiles?mode=memory&cache=shared"), &gorm.Config{})
+	require.NoError(t, err)
+	require.NoError(t, db.AutoMigrate(&model.RinOperation{}))
+	previous := model.DB
+	model.DB = db
+	t.Cleanup(func() { model.DB = previous })
+	t.Setenv("RINSPACE_RIN_TOKEN_ID", "91")
+	t.Setenv("RINSPACE_RIN_RECEIPT_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	engine := gin.New()
+	engine.Use(func(c *gin.Context) {
+		id := 91
+		if c.GetHeader("X-Fixture-Token") == "foreign" {
+			id = 92
+		}
+		c.Set("token_id", id)
+		c.Next()
+	})
+	engine.Use(RinTokenScope(), RinOperationReceipt())
+	calls := 0
+	engine.POST("/v1/chat/completions", func(c *gin.Context) {
+		calls++
+		assert.Empty(t, c.GetHeader(rinBudgetProfileHeader), "internal profile must not leak to the provider")
+		text := "synthetic answer"
+		if c.GetHeader(rinOperationHeader) == "reader-large" {
+			text = strings.Repeat("x", 2<<20)
+		}
+		if c.GetHeader(rinOperationHeader) == "reader-overflow" {
+			text = strings.Repeat("x", 4<<20)
+		}
+		c.JSON(http.StatusOK, gin.H{"text": text})
+	})
+	engine.GET("/v1/rin/operations/:key", ReadRinOperationReceipt())
+	tool := map[string]any{"type": "function", "function": map[string]any{"name": "read_pages", "description": "Read bounded pages.", "parameters": map[string]any{"type": "object", "properties": map[string]any{}}}}
+	body := func(messages int, text string, tokens int) string {
+		list := []map[string]any{{"role": "system", "content": "Use only declared tools."}}
+		for range messages - 1 {
+			list = append(list, map[string]any{"role": "user", "content": text})
+		}
+		encoded, err := common.Marshal(map[string]any{"model": "deepseek-flash", "messages": list, "tools": []any{tool}, "tool_choice": "auto", "stream": false, "max_tokens": tokens, "temperature": 0.2, "thinking": map[string]string{"type": "disabled"}})
+		require.NoError(t, err)
+		return string(encoded)
+	}
+	send := func(key, profile, body string, foreign, duplicate bool) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		if key != "" {
+			request.Header.Set(rinOperationHeader, key)
+		}
+		if profile != "" {
+			request.Header.Set(rinBudgetProfileHeader, profile)
+		}
+		if duplicate {
+			request.Header.Add(rinBudgetProfileHeader, "reader-learning/v1")
+		}
+		if foreign {
+			request.Header.Set("X-Fixture-Token", "foreign")
+		}
+		response := httptest.NewRecorder()
+		engine.ServeHTTP(response, request)
+		return response
+	}
+	large := body(100, strings.Repeat("a", 700), 32768)
+	assert.Equal(t, http.StatusBadRequest, send("legacy-large", "", large, false, false).Code)
+	assert.Equal(t, http.StatusBadRequest, send("agent-many", "rin-agent/v2", large, false, false).Code)
+	first := send("reader-large", "reader-learning/v1", large, false, false)
+	require.Equal(t, http.StatusOK, first.Code)
+	assert.Greater(t, first.Body.Len(), 1<<20)
+	assert.Equal(t, first.Body.String(), send("reader-large", "reader-learning/v1", large, false, false).Body.String())
+	query := httptest.NewRecorder()
+	engine.ServeHTTP(query, httptest.NewRequest(http.MethodGet, "/v1/rin/operations/reader-large", nil))
+	assert.Equal(t, first.Body.String(), query.Body.String())
+	assert.Equal(t, 1, calls)
+	assert.Equal(t, http.StatusOK, send("reader-page", "reader-learning/v1", body(2, strings.Repeat("a", 80000), 32768), false, false).Code)
+	assert.Equal(t, http.StatusBadRequest, send("agent-page", "rin-agent/v2", body(2, strings.Repeat("a", 80000), 32768), false, false).Code)
+	shared := body(2, "hello", 4096)
+	require.Equal(t, http.StatusOK, send("shared-key", "reader-learning/v1", shared, false, false).Code)
+	assert.Equal(t, http.StatusConflict, send("shared-key", "rin-agent/v2", shared, false, false).Code)
+	assert.Equal(t, http.StatusOK, send("old-key", "", shared, false, false).Code)
+	assert.Equal(t, http.StatusConflict, send("old-key", "rin-agent/v2", shared, false, false).Code)
+	assert.Equal(t, http.StatusOK, send("agent-output", "rin-agent/v2", body(2, "hello", 393216), false, false).Code)
+	assert.Equal(t, http.StatusServiceUnavailable, send("reader-overflow", "reader-learning/v1", shared, false, false).Code)
+	countAfterOverflow := calls
+	assert.Equal(t, http.StatusAccepted, send("reader-overflow", "reader-learning/v1", shared, false, false).Code)
+	assert.Equal(t, countAfterOverflow, calls, "an oversized receipt must remain unknown without another model call")
+	before := calls
+	for _, test := range []struct {
+		name, profile      string
+		foreign, duplicate bool
+		status             int
+	}{
+		{"unknown", "reader-learning/v999", false, false, http.StatusBadRequest},
+		{"duplicate", "reader-learning/v1", false, true, http.StatusBadRequest},
+		{"foreign", "reader-learning/v1", true, false, http.StatusForbidden},
+	} {
+		assert.Equal(t, test.status, send(test.name, test.profile, shared, test.foreign, test.duplicate).Code, test.name)
+	}
+	assert.Equal(t, http.StatusForbidden, send("", "reader-learning/v1", shared, true, false).Code)
+	assert.Equal(t, http.StatusBadRequest, send("reader-output", "reader-learning/v1", body(2, "hello", 65537), false, false).Code)
+	assert.Equal(t, http.StatusBadRequest, send("agent-output-over", "rin-agent/v2", body(2, "hello", 393217), false, false).Code)
+	assert.Equal(t, http.StatusBadRequest, send("reader-messages", "reader-learning/v1", body(257, "hello", 32768), false, false).Code)
+	assert.Equal(t, http.StatusBadRequest, send("reader-message", "reader-learning/v1", body(2, strings.Repeat("x", (1<<20)+1), 32768), false, false).Code)
+	assert.Equal(t, http.StatusRequestEntityTooLarge, send("reader-bytes", "reader-learning/v1", strings.Repeat(" ", (8<<20)+1), false, false).Code)
+	assert.Equal(t, before, calls, "invalid scopes/limits must not invoke the provider")
 }

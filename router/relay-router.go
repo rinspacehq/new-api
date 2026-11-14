@@ -79,6 +79,7 @@ func SetRelayRouter(router *gin.Engine) {
 		relayV1Router.GET("/responses", controller.ResponsesWebSocket)
 		relayV1Router.GET("/rin/operations/:key", middleware.ReadRinOperationReceipt())
 		relayV1Router.POST("/rin/operations/:key/abort", middleware.AbortMissingRinOperation())
+		relayV1Router.DELETE("/rin/operations/:key/content", middleware.PurgeRinLearningReceiptContent())
 	}
 	relayV1Router.Use(middleware.RinOperationReceipt())
 	relayV1Router.Use(middleware.ModelRequestRateLimit())

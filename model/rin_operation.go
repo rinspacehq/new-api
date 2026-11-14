@@ -16,11 +16,13 @@ type RinOperation struct {
 	TokenID            int    `gorm:"uniqueIndex:idx_rin_operation_token_key;not null"`
 	OperationKey       string `gorm:"size:128;uniqueIndex:idx_rin_operation_token_key;not null"`
 	RequestHash        string `gorm:"size:64;not null"`
+	BudgetProfile      string `gorm:"size:64;not null;default:''"`
 	Status             string `gorm:"size:16;not null;index:idx_rin_operation_status_created,priority:1"`
 	HTTPStatus         int
 	ResponseCiphertext []byte
 	CreatedAt          time.Time `gorm:"index:idx_rin_operation_status_created,priority:2"`
 	CompletedAt        *time.Time
+	ContentPurgedAt    *time.Time
 }
 
 const (
@@ -31,16 +33,24 @@ const (
 )
 
 var ErrRinOperationConflict = errors.New("rin operation key has a different request")
+var ErrRinOperationPending = errors.New("rin operation receipt is not terminal")
 
 // ClaimRinOperation returns claimed=true only to the one caller permitted to
 // start the upstream call. An existing unknown operation is never reclaimed.
 func ClaimRinOperation(db *gorm.DB, tokenID int, key, hash string) (RinOperation, bool, error) {
-	if tokenID <= 0 || len(key) == 0 || len(key) > 128 || len(hash) != 64 {
+	return ClaimRinOperationWithProfile(db, tokenID, key, hash, "")
+}
+
+// ClaimRinOperationWithProfile freezes the transport scope with the first claim.
+// Existing receipts remain on the empty legacy scope after migration.
+func ClaimRinOperationWithProfile(db *gorm.DB, tokenID int, key, hash, profile string) (RinOperation, bool, error) {
+	if tokenID <= 0 || len(key) == 0 || len(key) > 128 || len(hash) != 64 ||
+		(profile != "" && profile != "rin-agent/v2" && profile != "reader-learning/v1") {
 		return RinOperation{}, false, errors.New("invalid rin operation identity")
 	}
 	operation := RinOperation{
 		TokenID: tokenID, OperationKey: key, RequestHash: hash,
-		Status: RinOperationUnknown,
+		Status: RinOperationUnknown, BudgetProfile: profile,
 	}
 	result := db.Clauses(clause.OnConflict{DoNothing: true}).Create(&operation)
 	if result.Error != nil {
@@ -52,10 +62,36 @@ func ClaimRinOperation(db *gorm.DB, tokenID int, key, hash string) (RinOperation
 	if err := db.Where("token_id = ? AND operation_key = ?", tokenID, key).Take(&operation).Error; err != nil {
 		return RinOperation{}, false, err
 	}
-	if operation.RequestHash != hash {
+	if operation.RequestHash != hash || operation.BudgetProfile != profile {
 		return RinOperation{}, false, ErrRinOperationConflict
 	}
 	return operation, false, nil
+}
+
+// PurgeRinLearningReceiptContent only removes a terminal learning receipt's
+// private body. The trusted product calls this after its own original usage has
+// settled. The original key/hash/status remain immutable replay tombstones.
+func PurgeRinLearningReceiptContent(db *gorm.DB, tokenID int, key string) error {
+	if tokenID <= 0 || len(key) == 0 || len(key) > 128 {
+		return errors.New("invalid rin operation identity")
+	}
+	return db.Transaction(func(tx *gorm.DB) error {
+		var operation RinOperation
+		if err := lockForUpdate(tx).Where("token_id = ? AND operation_key = ? AND budget_profile = ?", tokenID, key, "reader-learning/v1").Take(&operation).Error; err != nil {
+			return err
+		}
+		if operation.Status == RinOperationUnknown {
+			return ErrRinOperationPending
+		}
+		if operation.Status != RinOperationCompleted && operation.Status != RinOperationFailed && operation.Status != RinOperationExpired {
+			return errors.New("invalid rin operation receipt")
+		}
+		if operation.ContentPurgedAt != nil {
+			return nil
+		}
+		return tx.Model(&RinOperation{}).Where("id = ? AND status = ? AND content_purged_at IS NULL", operation.ID, operation.Status).
+			Updates(map[string]any{"response_ciphertext": nil, "content_purged_at": time.Now().UTC()}).Error
+	})
 }
 
 // AbortUnclaimedRinOperation atomically leaves a tombstone for a request that
