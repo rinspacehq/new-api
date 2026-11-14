@@ -5,9 +5,7 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -83,6 +81,7 @@ type rinReceiptWriter struct {
 	body     bytes.Buffer
 	status   int
 	tooLarge bool
+	limit    int
 }
 
 func (w *rinReceiptWriter) Header() http.Header  { return w.header }
@@ -106,7 +105,11 @@ func (w *rinReceiptWriter) Written() bool { return w.status != 0 || w.body.Len()
 func (w *rinReceiptWriter) Flush() {}
 func (w *rinReceiptWriter) Write(p []byte) (int, error) {
 	w.WriteHeaderNow()
-	if w.body.Len()+len(p) > rinReceiptLimit {
+	limit := w.limit
+	if limit == 0 {
+		limit = rinReceiptLimit
+	}
+	if w.body.Len()+len(p) > limit {
 		w.tooLarge = true
 		return len(p), nil
 	}
@@ -139,7 +142,7 @@ func encryptRinReceipt(aead cipher.AEAD, operation model.RinOperation, body []by
 }
 
 func decryptRinReceipt(aead cipher.AEAD, operation model.RinOperation) ([]byte, error) {
-	if len(operation.ResponseCiphertext) < aead.NonceSize() {
+	if len(operation.ResponseCiphertext) < aead.NonceSize() || len(operation.ResponseCiphertext) > (4<<20)+aead.NonceSize()+aead.Overhead() {
 		return nil, errors.New("rin receipt is missing")
 	}
 	nonce := operation.ResponseCiphertext[:aead.NonceSize()]
@@ -199,11 +202,16 @@ func rinJSONObject(raw []byte) bool {
 }
 
 func validRinChatRequest(body []byte, fields map[string]any) bool {
+	budget, _ := readRinBudget(http.Header{})
+	return validRinChatBudgetRequest(body, fields, budget)
+}
+
+func validRinChatBudgetRequest(body []byte, fields map[string]any, budget rinBudget) bool {
 	var request rinOperationRequest
 	if common.Unmarshal(body, &request) != nil ||
 		!rinExactFields(fields, "model", "messages", "stream", "max_tokens", "temperature", "thinking") ||
 		request.Model != "deepseek-flash" || request.Stream ||
-		request.MaxTokens < 1 || request.MaxTokens > 4096 ||
+		request.MaxTokens < 1 || request.MaxTokens > budget.outputTokens ||
 		request.Temperature < 0 || request.Temperature > 2 ||
 		request.Thinking.Type != "disabled" || len(request.Messages) < 2 || len(request.Messages) > 16 {
 		return false
@@ -232,13 +240,18 @@ func validRinChatRequest(body []byte, fields map[string]any) bool {
 }
 
 func validRinAgentRequest(body []byte, fields map[string]any) bool {
+	budget, _ := readRinBudget(http.Header{})
+	return validRinAgentBudgetRequest(body, fields, budget)
+}
+
+func validRinAgentBudgetRequest(body []byte, fields map[string]any, budget rinBudget) bool {
 	var request rinOperationRequest
 	if common.Unmarshal(body, &request) != nil ||
 		!rinExactFields(fields, "model", "messages", "tools", "tool_choice", "stream", "max_tokens", "temperature", "thinking") ||
 		request.Model != "deepseek-flash" || request.ToolChoice != "auto" || request.Stream ||
-		request.MaxTokens < 1 || request.MaxTokens > 4096 ||
+		request.MaxTokens < 1 || request.MaxTokens > budget.outputTokens ||
 		request.Temperature < 0 || request.Temperature > 2 ||
-		request.Thinking.Type != "disabled" || len(request.Messages) == 0 || len(request.Messages) > rinAgentMessageLimit ||
+		request.Thinking.Type != "disabled" || len(request.Messages) == 0 || len(request.Messages) > budget.messages ||
 		len(request.Tools) == 0 || len(request.Tools) > rinAgentToolLimit {
 		return false
 	}
@@ -283,7 +296,7 @@ func validRinAgentRequest(body []byte, fields map[string]any) bool {
 	for i, message := range request.Messages {
 		original, valid := rawMessages[i].(map[string]any)
 		role, validRole := original["role"].(string)
-		if !valid || len(message.Content) > rinAgentContentLimit || !utf8.ValidString(message.Content) ||
+		if !valid || len(message.Content) > budget.messageBytes || !utf8.ValidString(message.Content) ||
 			!validRole || role != message.Role {
 			return false
 		}
@@ -320,7 +333,7 @@ func validRinAgentRequest(body []byte, fields map[string]any) bool {
 					!validFunction || !rinExactFields(rawFunction, "name", "arguments") ||
 					call.Type != "function" || !rinAgentCallID(call.ID) ||
 					!rinAgentName(call.Function.Name) || len(call.Function.Arguments) == 0 ||
-					len(call.Function.Arguments) > rinAgentContentLimit ||
+					len(call.Function.Arguments) > budget.messageBytes ||
 					common.Unmarshal([]byte(call.Function.Arguments), &arguments) != nil || arguments == nil {
 					return false
 				}
@@ -357,14 +370,19 @@ func validRinAgentRequest(body []byte, fields map[string]any) bool {
 }
 
 func validRinOperationRequest(body []byte) bool {
+	budget, _ := readRinBudget(http.Header{})
+	return validRinBudgetRequest(body, budget)
+}
+
+func validRinBudgetRequest(body []byte, budget rinBudget) bool {
 	var fields map[string]any
 	if common.Unmarshal(body, &fields) != nil || fields == nil {
 		return false
 	}
 	if _, isAgent := fields["tools"]; isAgent {
-		return validRinAgentRequest(body, fields)
+		return validRinAgentBudgetRequest(body, fields, budget)
 	}
-	return validRinChatRequest(body, fields)
+	return validRinChatBudgetRequest(body, fields, budget)
 }
 
 // RinTokenScope confines the dedicated service token to the chat call and
@@ -380,6 +398,10 @@ func rinReceiptControlRoute(method, path string) bool {
 	}
 	if method == http.MethodPost && strings.HasSuffix(key, "/abort") {
 		key = strings.TrimSuffix(key, "/abort")
+		return key != "" && !strings.Contains(key, "/")
+	}
+	if method == http.MethodDelete && strings.HasSuffix(key, "/content") {
+		key = strings.TrimSuffix(key, "/content")
 		return key != "" && !strings.Contains(key, "/")
 	}
 	return false
@@ -414,7 +436,8 @@ func RinOperationReceipt() gin.HandlerFunc {
 		}
 		configuredToken := rinTokenID()
 		key := strings.TrimSpace(c.GetHeader(rinOperationHeader))
-		if configuredToken == 0 && key == "" || configuredToken != c.GetInt("token_id") && key == "" {
+		hasBudget := len(c.Request.Header.Values(rinBudgetProfileHeader)) != 0
+		if !hasBudget && (configuredToken == 0 && key == "" || configuredToken != c.GetInt("token_id") && key == "") {
 			c.Next()
 			return
 		}
@@ -426,23 +449,28 @@ func RinOperationReceipt() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rin operation key is invalid"})
 			return
 		}
+		budget, validBudget := readRinBudget(c.Request.Header)
+		if !validBudget {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rin budget profile is invalid"})
+			return
+		}
 		aead, err := rinReceiptCipher()
 		if err != nil {
 			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "rin operation receipts are unavailable"})
 			return
 		}
-		body, err := io.ReadAll(io.LimitReader(c.Request.Body, rinReceiptLimit+1))
-		if err != nil || len(body) > rinReceiptLimit {
+		body, err := io.ReadAll(io.LimitReader(c.Request.Body, int64(budget.requestBytes)+1))
+		if err != nil || len(body) > budget.requestBytes {
 			c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": "rin request is too large"})
 			return
 		}
-		if !validRinOperationRequest(body) {
+		if !validRinBudgetRequest(body, budget) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "rin chat request is invalid"})
 			return
 		}
 		c.Request.Body = io.NopCloser(bytes.NewReader(body))
-		hash := sha256.Sum256(body)
-		operation, claimed, err := model.ClaimRinOperation(model.DB, configuredToken, key, hex.EncodeToString(hash[:]))
+		hash := rinBudgetRequestHash(budget, body)
+		operation, claimed, err := model.ClaimRinOperationWithProfile(model.DB, configuredToken, key, hash, budget.profile)
 		if errors.Is(err, model.ErrRinOperationConflict) {
 			c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": "rin operation key has a different request"})
 			return
@@ -458,7 +486,8 @@ func RinOperationReceipt() gin.HandlerFunc {
 		}
 
 		original := c.Writer
-		captured := &rinReceiptWriter{ResponseWriter: original, header: original.Header().Clone()}
+		captured := &rinReceiptWriter{ResponseWriter: original, header: original.Header().Clone(), limit: budget.responseBytes}
+		c.Request.Header.Del(rinBudgetProfileHeader)
 		c.Writer = captured
 		c.Next()
 		c.Writer = original
@@ -492,6 +521,11 @@ func RinOperationReceipt() gin.HandlerFunc {
 }
 
 func writeRinOperationReceipt(c *gin.Context, aead cipher.AEAD, operation model.RinOperation) {
+	if operation.ContentPurgedAt != nil {
+		c.Header(rinOperationStatusHeader, "content_deleted")
+		c.JSON(http.StatusGone, gin.H{"status": "content_deleted"})
+		return
+	}
 	switch operation.Status {
 	case model.RinOperationUnknown:
 		c.Header(rinOperationStatusHeader, model.RinOperationUnknown)
@@ -509,6 +543,34 @@ func writeRinOperationReceipt(c *gin.Context, aead cipher.AEAD, operation model.
 		c.Data(operation.HTTPStatus, "application/json", body)
 	default:
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "rin operation receipt is invalid"})
+	}
+}
+
+// PurgeRinLearningReceiptContent is an internal service control route. Neither
+// a guessed key nor a different/legacy budget profile grants deletion rights.
+func PurgeRinLearningReceiptContent() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		budget, valid := readRinBudget(c.Request.Header)
+		if rinTokenID() == 0 || c.GetInt("token_id") != rinTokenID() || !valid || budget.profile != "reader-learning/v1" {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+		key := c.Param("key")
+		if key == "" || len(key) > 128 || strings.ContainsAny(key, "/\r\n\x00") || c.Request.ContentLength != 0 || len(c.Request.TransferEncoding) != 0 || c.Request.URL.RawQuery != "" {
+			c.AbortWithStatus(http.StatusBadRequest)
+			return
+		}
+		err := model.PurgeRinLearningReceiptContent(model.DB, rinTokenID(), key)
+		switch {
+		case errors.Is(err, gorm.ErrRecordNotFound):
+			c.AbortWithStatus(http.StatusNotFound)
+		case errors.Is(err, model.ErrRinOperationPending):
+			c.AbortWithStatus(http.StatusConflict)
+		case err != nil:
+			c.AbortWithStatus(http.StatusServiceUnavailable)
+		default:
+			c.Status(http.StatusNoContent)
+		}
 	}
 }
 
